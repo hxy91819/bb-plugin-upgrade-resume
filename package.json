@@ -1,0 +1,50 @@
+{
+  "name": "bb-plugin-upgrade-resume",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Resume BB threads interrupted by a prepared server upgrade.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hxy91819/bb-plugin-upgrade-resume.git"
+  },
+  "engines": {
+    "node": ">=22",
+    "bb": ">=0.46.0",
+    "bbPluginSdk": ">=0.6.37 <0.7.0"
+  },
+  "bb": {
+    "name": "Upgrade Resume",
+    "description": "Record running threads before an upgrade and continue interrupted work after restart.",
+    "branding": {
+      "icon": "RefreshCw"
+    },
+    "server": "./src/server.ts",
+    "skills": [
+      "skills"
+    ]
+  },
+  "scripts": {
+    "build": "bb plugin build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "npm run format:check && npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.37",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.0.0",
+    "better-sqlite3": "^12.0.0",
+    "cron-parser": "^5.10.2",
+    "hono": "^4.13.13",
+    "prettier": "^3.6.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.1"
+  }
+}
