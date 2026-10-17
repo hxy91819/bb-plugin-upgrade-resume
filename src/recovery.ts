@@ -11,6 +11,7 @@ const resumePrompt =
 const eventTypes = [
   "client/turn/requested",
   "turn/completed",
+  "system/error",
   "system/thread/interrupted",
   "system/interaction/lifecycle",
 ] as const;
@@ -229,6 +230,13 @@ export class Recovery {
           interrupted = true;
         }
         if (
+          event.type === "system/error" &&
+          event.data.code === "provider_process_exited" &&
+          event.createdAt < performance.timeOrigin
+        ) {
+          interrupted = true;
+        }
+        if (
           event.type === "turn/completed" &&
           event.data.status === "completed"
         ) {
@@ -251,7 +259,7 @@ export class Recovery {
     }
     if (!interrupted) {
       entry.detail =
-        "Waiting for evidence that the recorded task was interrupted by the daemon restart.";
+        "Waiting for a daemon interruption or a provider process exit before this server started.";
       return;
     }
     if (thread.status !== "idle" && thread.status !== "error") {

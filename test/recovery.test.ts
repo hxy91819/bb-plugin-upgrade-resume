@@ -7,6 +7,7 @@ import {
   experimental_scanPublicSdkOnly,
 } from "@get-bb/plugin-sdk/testing";
 import { fileURLToPath } from "node:url";
+import { performance } from "node:perf_hooks";
 import plugin from "../src/server.js";
 import { Store } from "../src/store.js";
 
@@ -63,7 +64,10 @@ function interruption(
   };
 }
 
-function completion(seq = 2): Event {
+function completion(
+  seq = 2,
+  status: "completed" | "failed" = "completed",
+): Event {
   return {
     id: `event_${seq}`,
     threadId: "thread_1",
@@ -71,7 +75,22 @@ function completion(seq = 2): Event {
     createdAt: Date.now(),
     scope: { kind: "turn", turnId: "turn_1" },
     type: "turn/completed",
-    data: { providerThreadId: "provider_1", status: "completed" },
+    data: { providerThreadId: "provider_1", status },
+  };
+}
+
+function processExit(seq = 3, createdAt = Date.now()): Event {
+  return {
+    id: `event_${seq}`,
+    threadId: "thread_1",
+    seq,
+    createdAt,
+    scope: { kind: "turn", turnId: "turn_1" },
+    type: "system/error",
+    data: {
+      code: "provider_process_exited",
+      message: 'Provider "codex" exited unexpectedly with code 0',
+    },
   };
 }
 
@@ -262,31 +281,48 @@ describe("prepared upgrade recovery through the plugin CLI", () => {
     },
   );
 
-  it("does not turn an unrelated failure into an upgrade continuation", async () => {
+  it.each([
+    { reason: "an ordinary failed turn", events: [completion(2, "failed")] },
+    { reason: "a provider exit after restart", events: [processExit()] },
+  ])("does not continue after $reason", async ({ events }) => {
     const app = await setup();
     await app.prepare();
     app.restart();
     app.setThread({ status: "error" });
+    app.setEvents([request(), ...events]);
     await app.command(["resume"]);
     expect(app.sent).toEqual([]);
     expect(app.status().entries[0]!.state).toBe("pending");
   });
 
-  it("runs recovery automatically when its background service starts", async () => {
-    const app = await setup();
-    await app.prepare();
-    app.restart();
-    app.setThread({ status: "idle" });
-    app.setEvents([request(), interruption()]);
-    const service = app.harness.behavior.runService("upgrade-resume");
-    try {
-      await expect.poll(() => app.sent).toEqual(["thread_1"]);
-    } finally {
-      service.controller.abort();
-      await service.done;
-    }
-    expect(app.status().entries[0]!.state).toBe("resumed");
-  });
+  it.each([
+    { reason: "daemon restart", events: [interruption()], status: "idle" },
+    {
+      reason: "provider exit during shutdown",
+      events: [
+        completion(2, "failed"),
+        processExit(3, performance.timeOrigin - 1),
+      ],
+      status: "error",
+    },
+  ] as const)(
+    "automatically recovers after $reason",
+    async ({ events, status }) => {
+      const app = await setup();
+      await app.prepare();
+      app.restart();
+      app.setThread({ status });
+      app.setEvents([request(), ...events]);
+      const service = app.harness.behavior.runService("upgrade-resume");
+      try {
+        await expect.poll(() => app.sent).toEqual(["thread_1"]);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+      expect(app.status().entries[0]!.state).toBe("resumed");
+    },
+  );
 
   it("excludes approvals when preparing and preserves approvals encountered during recovery", async () => {
     const app = await setup();
