@@ -6,10 +6,16 @@
 
 ## 安装
 
-需要 BB 0.46.0 或以上、Plugin SDK 0.6.37 至 0.6.x。仓库目前为私有仓库，建议先在 BB 所在机器克隆，再按本地路径安装：
+需要 BB 0.46.0 或以上、Plugin SDK 0.6.37 至 0.6.x。可直接按 Git 来源安装：
 
 ```bash
-gh repo clone hxy91819/bb-plugin-upgrade-resume
+bb plugin install 'git:https://github.com/hxy91819/bb-plugin-upgrade-resume.git@main' --yes
+```
+
+也可在 BB 所在机器克隆到持久目录后按本地路径安装：
+
+```bash
+git clone https://github.com/hxy91819/bb-plugin-upgrade-resume.git
 cd bb-plugin-upgrade-resume
 npm ci
 npm run build
