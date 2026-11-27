@@ -10,6 +10,8 @@ const resumePrompt =
   "上次执行因 BB 服务升级中断。请先检查当前进度、仍在运行的命令和已有工具结果，避免重复执行已完成的操作，然后继续完成原任务。";
 const eventTypes = [
   "client/turn/requested",
+  "client/turn/rejected",
+  "turn/input/accepted",
   "turn/completed",
   "system/error",
   "system/thread/interrupted",
@@ -73,28 +75,32 @@ export class Recovery {
           )
         )
           continue;
-        const [requests, latest] = await Promise.all([
-          this.bb.sdk.threads.events.list({
-            threadId: thread.id,
-            types: ["client/turn/requested"],
-            order: "desc",
-            limit: "1",
-          }),
-          this.bb.sdk.threads.events.list({
-            threadId: thread.id,
-            types: [...eventTypes],
-            order: "desc",
-            limit: "1",
-          }),
-        ]);
-        const request = requests[0];
+        const [checkpoint] = await this.bb.sdk.threads.events.list({
+          threadId: thread.id,
+          types: [...eventTypes],
+          order: "desc",
+          limit: "1",
+        });
+        if (!checkpoint) continue;
+        const request =
+          checkpoint.type === "client/turn/requested"
+            ? checkpoint
+            : (
+                await this.bb.sdk.threads.events.list({
+                  threadId: thread.id,
+                  types: ["client/turn/requested"],
+                  beforeSeq: String(checkpoint.seq),
+                  order: "desc",
+                  limit: "1",
+                })
+              )[0];
         if (request?.type !== "client/turn/requested") continue;
         entries.push({
           threadId: thread.id,
           hostId: runningThread.hostId,
           requestId: request.data.requestId,
           requestSeq: request.seq,
-          checkpointSeq: latest[0]?.seq ?? request.seq,
+          checkpointSeq: checkpoint.seq,
           state: "pending",
           detail: "Waiting for the BB server process to restart.",
         });
@@ -139,7 +145,12 @@ export class Recovery {
         signal.aborted
       )
         return batch;
-      batch.state = "recovering";
+      const recoveryBootAt = batch.recoveryBootAt ?? performance.timeOrigin;
+      if (batch.recoveryBootAt === undefined) {
+        batch.recoveryBootAt = recoveryBootAt;
+        batch.state = "recovering";
+        this.store.save(batch);
+      }
       for (const entry of batch.entries) {
         if (signal.aborted || this.cancelRequested) break;
         if (entry.state === "sending") {
@@ -149,7 +160,7 @@ export class Recovery {
         }
         if (entry.state !== "pending") continue;
         try {
-          await this.recover(batch, entry, signal);
+          await this.recover(batch, entry, recoveryBootAt, signal);
         } catch (error) {
           if (wasSending(entry)) {
             entry.state = "uncertain";
@@ -177,6 +188,7 @@ export class Recovery {
   private async recover(
     batch: Batch,
     entry: Entry,
+    recoveryBootAt: number,
     signal: AbortSignal,
   ): Promise<void> {
     const thread = await this.bb.sdk.threads.get({
@@ -197,12 +209,21 @@ export class Recovery {
     const request = latest[0];
     if (
       request?.type !== "client/turn/requested" ||
-      request.data.requestId !== entry.requestId
+      request.seq < entry.requestSeq ||
+      (request.seq === entry.requestSeq &&
+        request.data.requestId !== entry.requestId)
     ) {
+      skip(entry, "The recorded dispatch is no longer available.");
+      return;
+    }
+    const successor = request.seq > entry.requestSeq;
+    if (successor && request.createdAt >= recoveryBootAt) {
       skip(entry, "A newer dispatch already took over this thread.");
       return;
     }
-    let cursor = entry.checkpointSeq;
+    let cursor = successor ? request.seq : entry.checkpointSeq;
+    let turnId: string | undefined;
+    let matchingInterruption = false;
     let interrupted = false;
     while (true) {
       const events = await this.bb.sdk.threads.events.list({
@@ -216,8 +237,40 @@ export class Recovery {
       for (const event of events) {
         cursor = event.seq;
         if (event.type === "client/turn/requested") {
-          skip(entry, "A newer dispatch already took over this thread.");
+          entry.detail =
+            "Dispatch changed while checking the thread; checking again on the next pass.";
           return;
+        }
+        if (
+          successor &&
+          event.type === "turn/input/accepted" &&
+          event.data.clientRequestId === request.data.requestId &&
+          event.scope.kind === "turn"
+        ) {
+          if (event.createdAt >= recoveryBootAt) {
+            skip(entry, "A newer dispatch already took over this thread.");
+            return;
+          }
+          turnId = event.scope.turnId;
+        }
+        if (
+          successor &&
+          event.type === "client/turn/rejected" &&
+          event.data.requestId === request.data.requestId
+        ) {
+          skip(entry, "The newer dispatch was rejected.");
+          return;
+        }
+        const matchesTurn =
+          !successor ||
+          (event.scope.kind === "turn" && event.scope.turnId === turnId);
+        if (event.type === "turn/completed") {
+          matchingInterruption =
+            matchesTurn && event.data.status === "interrupted";
+          if (matchesTurn && event.data.status === "completed") {
+            skip(entry, "The latest task completed.");
+            return;
+          }
         }
         if (event.type === "system/thread/interrupted") {
           if (event.data.reason !== "host-daemon-restarted") {
@@ -227,21 +280,15 @@ export class Recovery {
             );
             return;
           }
-          interrupted = true;
+          interrupted ||= !successor || matchingInterruption;
         }
         if (
           event.type === "system/error" &&
           event.data.code === "provider_process_exited" &&
-          event.createdAt < performance.timeOrigin
+          matchesTurn &&
+          event.createdAt < recoveryBootAt
         ) {
           interrupted = true;
-        }
-        if (
-          event.type === "turn/completed" &&
-          event.data.status === "completed"
-        ) {
-          skip(entry, "The recorded task completed.");
-          return;
         }
         if (
           event.type === "system/interaction/lifecycle" &&
@@ -256,6 +303,11 @@ export class Recovery {
         }
       }
       if (events.length < eventPageSize) break;
+    }
+    if (successor && !turnId) {
+      entry.detail =
+        "Waiting for evidence that the newer dispatch started before the server restarted.";
+      return;
     }
     if (!interrupted) {
       entry.detail =
@@ -288,8 +340,33 @@ export class Recovery {
       skip(entry, "The thread is waiting for user input.");
       return;
     }
-    if (thread.queuedMessageCount > 0) {
+    const current = await this.bb.sdk.threads.get({
+      threadId: entry.threadId,
+      signal,
+    });
+    if (current.archivedAt !== null || current.deletedAt !== null) {
+      skip(entry, "Thread was archived or deleted.");
+      return;
+    }
+    if (current.queuedMessageCount > 0) {
       skip(entry, "The thread already has queued work to continue.");
+      return;
+    }
+    if (current.status !== "idle" && current.status !== "error") {
+      entry.detail = `Waiting for the thread to settle (currently ${current.status}).`;
+      return;
+    }
+    const [changed] = await this.bb.sdk.threads.events.list({
+      threadId: entry.threadId,
+      types: [...eventTypes],
+      afterSeq: String(cursor),
+      order: "asc",
+      limit: "1",
+      signal,
+    });
+    if (changed) {
+      entry.detail =
+        "Thread changed before dispatch; checking again on the next pass.";
       return;
     }
     if (signal.aborted || this.cancelRequested) return;
@@ -309,7 +386,7 @@ export class Recovery {
       ],
       pluginSubmission: {
         pluginId: this.bb.pluginId,
-        data: { batchId: batch.id, requestId: entry.requestId },
+        data: { batchId: batch.id, requestId: request.data.requestId },
       },
     });
     entry.state = "resumed";

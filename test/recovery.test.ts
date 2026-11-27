@@ -21,12 +21,12 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
 });
 
-function request(seq = 1, requestId = "req_original"): Event {
+function request(seq = 1, requestId = "req_original", createdAt = 1): Event {
   return {
     id: `event_${seq}`,
     threadId: "thread_1",
     seq,
-    createdAt: 1,
+    createdAt,
     scope: { kind: "thread" },
     type: "client/turn/requested",
     data: {
@@ -66,26 +66,43 @@ function interruption(
 
 function completion(
   seq = 2,
-  status: "completed" | "failed" = "completed",
+  status: "completed" | "failed" | "interrupted" = "completed",
+  turnId = "turn_1",
 ): Event {
   return {
     id: `event_${seq}`,
     threadId: "thread_1",
     seq,
     createdAt: Date.now(),
-    scope: { kind: "turn", turnId: "turn_1" },
+    scope: { kind: "turn", turnId },
     type: "turn/completed",
     data: { providerThreadId: "provider_1", status },
   };
 }
 
-function processExit(seq = 3, createdAt = Date.now()): Event {
+function accepted(seq: number, createdAt = performance.timeOrigin - 1): Event {
   return {
     id: `event_${seq}`,
     threadId: "thread_1",
     seq,
     createdAt,
-    scope: { kind: "turn", turnId: "turn_1" },
+    scope: { kind: "turn", turnId: "turn_2" },
+    type: "turn/input/accepted",
+    data: { providerThreadId: "provider_1", clientRequestId: "req_new" },
+  };
+}
+
+function processExit(
+  seq = 3,
+  createdAt = Date.now(),
+  turnId = "turn_1",
+): Event {
+  return {
+    id: `event_${seq}`,
+    threadId: "thread_1",
+    seq,
+    createdAt,
+    scope: { kind: "turn", turnId },
     type: "system/error",
     data: {
       code: "provider_process_exited",
@@ -146,7 +163,9 @@ async function setup() {
               (event) =>
                 (!args.types || args.types.includes(event.type)) &&
                 (args.afterSeq === undefined ||
-                  event.seq > Number(args.afterSeq)),
+                  event.seq > Number(args.afterSeq)) &&
+                (args.beforeSeq === undefined ||
+                  event.seq < Number(args.beforeSeq)),
             );
             rows = [...rows].sort((a, b) =>
               args.order === "desc" ? b.seq - a.seq : a.seq - b.seq,
@@ -230,6 +249,30 @@ describe("prepared upgrade recovery through the plugin CLI", () => {
     expect((await app.command(["prepare"])).exitCode).toBe(1);
   });
 
+  it("keeps the request and checkpoint consistent when another dispatch lands during prepare", async () => {
+    const app = await setup();
+    const old = request();
+    const done = completion();
+    const newer = request(3, "req_new");
+    app.harness.inspection.sdk.stub(
+      "threads.events.list",
+      async (
+        args: Parameters<BbPluginApi["sdk"]["threads"]["events"]["list"]>[0],
+      ) =>
+        args.types?.length === 1
+          ? args.beforeSeq === undefined
+            ? [newer]
+            : [old]
+          : [done],
+    );
+    await app.prepare();
+    expect(app.status().entries[0]).toMatchObject({
+      requestId: "req_original",
+      requestSeq: 1,
+      checkpointSeq: 2,
+    });
+  });
+
   it("continues the original interrupted thread once after restart and machine reconnection", async () => {
     const app = await setup();
     await app.prepare();
@@ -252,10 +295,163 @@ describe("prepared upgrade recovery through the plugin CLI", () => {
     });
   });
 
+  it("continues the pre-restart successor interrupted after the prepared turn completed", async () => {
+    const app = await setup();
+    await app.prepare();
+    app.restart();
+    app.setThread({ status: "error" });
+    app.setEvents([
+      request(),
+      completion(),
+      request(3, "req_new", performance.timeOrigin - 2),
+      accepted(4),
+      completion(5, "interrupted", "turn_2"),
+      interruption(6),
+    ]);
+    await app.command(["resume"]);
+    expect(app.status().entries[0]!.state).toBe("resumed");
+    expect(app.sent).toEqual(["thread_1"]);
+    expect(
+      app.harness.inspection.sdk.callsTo("threads.send")[0]![0],
+    ).toMatchObject({
+      pluginSubmission: { data: { requestId: "req_new" } },
+    });
+  });
+
+  it("continues queued work drained into a turn before shutdown after that turn's provider exits", async () => {
+    const app = await setup();
+    app.setThread({ queuedMessageCount: 1 });
+    await app.prepare();
+    app.restart();
+    app.setThread({ status: "error", queuedMessageCount: 0 });
+    const drained = request(3, "req_new", performance.timeOrigin - 4);
+    if (drained.type !== "client/turn/requested")
+      throw new Error("Expected request");
+    drained.data.target = { kind: "auto", expectedTurnId: null };
+    app.setEvents([
+      request(),
+      completion(),
+      drained,
+      accepted(4, performance.timeOrigin - 3),
+      completion(5, "failed", "turn_2"),
+      processExit(6, performance.timeOrigin - 1, "turn_2"),
+    ]);
+    await app.command(["resume"]);
+    expect(app.sent).toEqual(["thread_1"]);
+    expect(app.status().entries[0]!.state).toBe("resumed");
+  });
+
+  it.each([
+    {
+      name: "the input is not accepted",
+      events: [completion(4, "interrupted", "turn_1"), interruption(5)],
+      state: "pending",
+    },
+    {
+      name: "the input is accepted after restart",
+      events: [
+        accepted(4, performance.timeOrigin + 1),
+        completion(5, "interrupted", "turn_2"),
+        interruption(6),
+      ],
+      state: "skipped",
+    },
+    {
+      name: "the provider exit belongs to the old turn",
+      events: [accepted(4), processExit(5, performance.timeOrigin - 1)],
+      state: "pending",
+    },
+    {
+      name: "the daemon interruption belongs to the old turn",
+      events: [
+        accepted(4),
+        completion(5, "interrupted", "turn_1"),
+        interruption(6),
+      ],
+      state: "pending",
+    },
+    {
+      name: "the successor completed",
+      events: [accepted(4), completion(5, "completed", "turn_2")],
+      state: "skipped",
+    },
+    {
+      name: "the successor was manually stopped",
+      events: [
+        accepted(4),
+        completion(5, "interrupted", "turn_2"),
+        interruption(6, "manual-stop"),
+      ],
+      state: "skipped",
+    },
+  ])("does not send a continuation when $name", async ({ events, state }) => {
+    const app = await setup();
+    await app.prepare();
+    app.restart();
+    app.setThread({ status: "error" });
+    app.setEvents([
+      request(),
+      completion(),
+      request(3, "req_new", performance.timeOrigin - 2),
+      ...events,
+    ]);
+    await app.command(["resume"]);
+    expect(app.sent).toEqual([]);
+    expect(app.status().entries[0]!.state).toBe(state);
+  });
+
+  it("does not move the takeover boundary forward if the server restarts again", async () => {
+    const app = await setup();
+    await app.prepare();
+    app.restart();
+    const store = new Store(app.bb.storage.database());
+    const batch = store.load()!;
+    store.save({
+      ...batch,
+      state: "recovering",
+      recoveryBootAt: performance.timeOrigin - 10,
+    });
+    app.setThread({ status: "error" });
+    app.setEvents([
+      request(),
+      request(2, "req_new", performance.timeOrigin - 5),
+      accepted(3),
+      completion(4, "interrupted", "turn_2"),
+      interruption(5),
+    ]);
+    await app.command(["resume"]);
+    expect(app.sent).toEqual([]);
+    expect(app.status().entries[0]!.state).toBe("skipped");
+  });
+
+  it("rechecks events after host readiness when a manual dispatch starts and settles during recovery", async () => {
+    const app = await setup();
+    await app.prepare();
+    app.restart();
+    app.setThread({ status: "idle" });
+    app.setEvents([request(), interruption()]);
+    app.harness.inspection.sdk.stub("hosts.get", async () => {
+      app.setEvents([
+        request(),
+        interruption(),
+        request(3, "req_manual", Date.now()),
+        completion(4, "completed", "turn_2"),
+      ]);
+      return makeHostResponse({ id: "host_1", status: "connected" });
+    });
+    await app.command(["resume"]);
+    expect(app.sent).toEqual([]);
+    await app.command(["resume"]);
+    expect(app.status().entries[0]!.state).toBe("skipped");
+  });
+
   it.each([
     ["completed", [request(), completion()]],
     ["manually stopped", [request(), interruption(2, "manual-stop")]],
-    ["already continued", [request(), interruption(), request(3, "req_new")]],
+    [
+      "already continued",
+      [request(), interruption(), request(3, "req_new", Date.now())],
+    ],
   ])("leaves a task alone when it was %s", async (_name, events) => {
     const app = await setup();
     await app.prepare();

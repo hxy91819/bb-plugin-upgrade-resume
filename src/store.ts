@@ -15,6 +15,7 @@ const batchSchema = z.object({
   id: z.string().min(1),
   bootId: z.string().min(1),
   preparedAt: z.number().int().nonnegative(),
+  recoveryBootAt: z.number().nonnegative().optional(),
   state: z.enum(["armed", "recovering", "finished", "cancelled"]),
   entries: z.array(entrySchema),
 });
